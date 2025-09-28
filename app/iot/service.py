@@ -2,7 +2,7 @@
 import asyncio
 import random
 import string
-from typing import Protocol
+from typing import Protocol, Awaitable, Any
 
 from .devices import HueLightDevice, SmartSpeakerDevice, SmartToiletDevice
 from .message import Message, MessageType
@@ -12,14 +12,14 @@ def generate_id(length: int = 8) -> str:
     return "".join(random.choices(string.ascii_uppercase, k=length))
 
 
-# Helpers de orquestração
-async def run_sequence(*coros) -> None:
-    for coro in coros:
-        await coro
+# Helpers com typing (Awaitable[Any]) — requisito 2.7 / 3.7
+async def run_sequence(*functions: Awaitable[Any]) -> None:
+    for func in functions:
+        await func
 
 
-async def run_parallel(*coros) -> None:
-    await asyncio.gather(*coros)
+async def run_parallel(*functions: Awaitable[Any]) -> None:
+    await asyncio.gather(*functions)
 
 
 class Device(Protocol):
@@ -56,10 +56,13 @@ class IOTService:
         return self.devices[device_id]
 
     async def send_msg(self, msg: Message) -> None:
-        await self.devices[msg.device_id].send_message(msg.msg_type, msg.data)
+        device = self.devices.get(msg.device_id)
+        if not device:
+            raise ValueError(f"Device {msg.device_id} not found")
+        await device.send_message(msg.msg_type, msg.data)
 
 
-# Orquestração end-to-end
+# Orquestração em estágios (outer run_sequence → inner run_parallel)
 async def orchestrate() -> None:
     service = IOTService()
 
@@ -67,19 +70,23 @@ async def orchestrate() -> None:
     spk = SmartSpeakerDevice()
     toi = SmartToiletDevice()
 
-    # registrar devices em paralelo
+    # registro concorrente
     hue_id, spk_id, toi_id = await asyncio.gather(
         service.register_device(hue),
         service.register_device(spk),
         service.register_device(toi),
     )
 
-    # wake-up
+    # ===== WAKE-UP program =====
     print("=====RUNNING PROGRAM======")
-    await run_parallel(
-        service.send_msg(Message(hue_id, MessageType.SWITCH_ON)),
-        run_sequence(
+    await run_sequence(
+        # Stage 1: ligar devices em paralelo
+        run_parallel(
+            service.send_msg(Message(hue_id, MessageType.SWITCH_ON)),
             service.send_msg(Message(spk_id, MessageType.SWITCH_ON)),
+        ),
+        # Stage 2: tocar música
+        run_parallel(
             service.send_msg(
                 Message(
                     spk_id,
@@ -91,13 +98,15 @@ async def orchestrate() -> None:
     )
     print("=====END OF PROGRAM======")
 
-    # sleep
+    # ===== SLEEP program =====
     print("=====RUNNING PROGRAM======")
-    await run_parallel(
-        service.send_msg(Message(hue_id, MessageType.SWITCH_OFF)),
-        run_sequence(
+    await run_sequence(
+        # Stage 1: desligar luz + speaker (em paralelo)
+        run_parallel(
+            service.send_msg(Message(hue_id, MessageType.SWITCH_OFF)),
             service.send_msg(Message(spk_id, MessageType.SWITCH_OFF)),
         ),
+        # Stage 2: toilet flush -> clean (sequência)
         run_sequence(
             service.send_msg(Message(toi_id, MessageType.FLUSH)),
             service.send_msg(Message(toi_id, MessageType.CLEAN)),
